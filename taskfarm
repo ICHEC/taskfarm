@@ -1,0 +1,254 @@
+#!/usr/bin/python -E
+#
+# ICHEC Taskfarm utility
+# 
+# Brief note on versions:
+# 
+#   The first taskfarm utility deployed on ICHEC systems was an MPI-based program.
+#   The module was named "taskfarm". Mostly deprecated but module kept on Stokes
+#   for legacy reasons.
+#   
+#   Since then a new, Python-based implementation was written and first deployed
+#   on Stokes. The module was named "taskfarm2" to differentiate it from the MPI
+#   implementation. However, its version numbers went from 1.0 to 1.2 (see below).
+#   
+#   Fionn inherits taskfarm2/1.2 from Stokes, with some minor modifications. But
+#   the name of the module reverts to taskfarm with an initial version number of
+#   2.3 to reflect its provenance.
+# 
+# Version 1.0: Initial release on Stokes.
+# 
+# Version 1.1: Improvements
+#              - Full environment support
+#              - Automatic directory change
+#              - Error handling on task file open failure
+# 
+# Version 1.2: Bug Fix
+#              - Resolved process management race condition
+#              Improvements
+#              - Core/tread counts as parameters
+#              - SMT mode for extra threads - %TASKFARM_TASKNUM% token in taskfile
+#              - Warn when large task counts are submitted
+# 
+# Version 2.3: Improvements
+#              - Explicitly call system version of Python to avoid potential
+#                conflict, e.g. if user loads a different Python module in the PBS
+#                script prior to running taskfarm. For similar reasons the "-E" flag
+#                is used to ignore user specified PYTHONPATH and PYTHONHOME paths
+#                which could cause module import failure in this script.
+#              - Modified Popen() to NOT invoke a bash login shell via "bash -l".
+#                Otherwise startup files (e.g. ~/.bash_profile) are sourced. Each
+#                task should inherit its environment from the PBS script calling
+#                taskfarm; sourcing startup files might cause unexpected behaviour.
+# Version 2.4: New features
+#              - force a kill of the farm if a certain file exists in the forder of the running task
+#                default name of the file is abbadon change it via  TASKFARM_STOPFILE
+#              - force a kill of the farm if a certain file exists in the forder of the running task
+#                and contains a certain magic word by default no magic is set.
+#                use TASKFARM_STOPMAGIC to define a word
+#              - TASKFARM_SLEEP controls at what intervals one checks for the file and, if the case,
+#                for the magic. Default value is 5 seconds
+
+import os
+import sys
+import signal
+import time
+import re 
+
+from subprocess import Popen
+
+# Physical characteristics of the compute nodes
+cores_per_node = 24
+threads_per_core = 2
+
+# A print function to control verbosity
+def verbose_print(str):
+    if not 'TASKFARM_SILENT' in os.environ:
+        print str
+        sys.stdout.flush()
+
+# Check comand line arguments
+if len(sys.argv) != 2:
+    print >> sys.stderr, 'Usage: %s <tasklist>' % sys.argv[0]
+    sys.exit(1)
+taskfile = sys.argv[1]
+
+# How many processes per node
+if 'TASKFARM_SMT' in os.environ:
+    smt = threads_per_core
+else:
+    smt = 1
+if 'TASKFARM_PPN' in os.environ:
+    try:
+        ppn = int(os.environ['TASKFARM_PPN'])
+    except:
+        print >> sys.stderr, 'Error: $TASKFARM_PPN must be an integer value.'
+        sys.exit(1)
+else:
+    ppn = cores_per_node * smt
+
+if 'TASKFARM_SLEEP' in os.environ:
+    sleep = float(os.environ['TASKFARM_SLEEP'])
+else:
+    sleep = 5.0
+        
+if 'TASKFARM_STOPFILE' in os.environ:
+  stopfile=os.environ['TASKFARM_STOPFILE']
+else:
+  stopfile="abbadon"
+#if a stop magic is set one shall look in the running folder of the PID in the stopfile for it... 
+# if found kill the farm  
+if 'TASKFARM_STOPMAGIC' in os.environ:
+  stopMagic=os.environ['TASKFARM_STOPMAGIC']
+else:
+  stopMagic=""
+# Error if an invalid process count is requested
+if smt > 1 and ppn > cores_per_node * threads_per_core:
+    print >> sys.stderr, 'Error: $TASKFARM_PPN must not exceed %d processes per node when $TASKFARM_SMT is set.' %(cores_per_node * threads_per_core,)
+    sys.exit(1)
+elif smt == 1 and ppn > cores_per_node:
+    print >> sys.stderr, 'Error: $TASKFARM_PPN must not exceed %d processes per node.' %(cores_per_node,)
+    sys.exit(1)
+elif ppn < 1:
+    print >> sys.stderr, 'Error: $TASKFARM_PPN must request one or more processes per node.'
+    sys.exit(1)
+
+# Generate a list of unique nodes
+work_nodes = []
+node_ids = []
+id_map = {}
+try:
+    nodef = open(os.environ['PBS_NODEFILE'])
+except KeyError:
+    print >> sys.stderr, 'Error opening PBS_NODEFILE. Exiting.'
+    sys.exit(2)
+id = 0
+for line in nodef:
+    node = line.strip()
+    if work_nodes.count(node) == 0:
+        for i in range(ppn):
+            tmp_id = id+i%cores_per_node
+            node_ids.append(tmp_id)
+            work_nodes.append(node)
+            id_map[tmp_id] = node
+    id += 1
+nodef.close()
+verbose_print('Taskfarm started with %d workers (%d per node).' % (len(work_nodes), ppn))
+
+def extractPaths(taskline):
+  np=re.search("^cd (\w+)", taskline)
+  if np is None:
+    np=re.search("^pushd (\w+)", taskline)
+  if np is None:
+    return ""
+  return np.groups()[0]
+# Generate a task list from file
+tasklist = []
+extraPaths = []
+tasknum = 0
+try:
+    taskf = open(taskfile)
+except:
+    print >> sys.stderr, 'Error opening task file. Exiting.'
+    sys.exit(2)
+for line in taskf:
+    parsedline = line.replace('%TASKFARM_TASKNUM%', str(tasknum))
+    tasklist.append(parsedline.strip())
+    extraPaths.append(extractPaths(line))
+    tasknum = tasknum + 1
+taskf.close()
+verbose_print('Taskfarm read %d tasks from file \'%s\'.' % (len(tasklist), taskfile))
+
+if len(tasklist) % len(work_nodes) != 0:
+    verbose_print('Warning: Taskfarm input should ideally provide a multiple of %d tasks for %d workers.' % (len(work_nodes), len(work_nodes)))
+if len(tasklist) / len(work_nodes) > 20:
+    verbose_print('Warning: There are %d tasks for %d workers. Taskfarm is not ideal for high-throughput workloads.' % (len(tasklist), len(work_nodes)))
+    verbose_print('Warning: Running many tasks of a very short duration with Taskfarm is quite inefficient.')
+
+# Build an environment
+environ = ''
+for param in os.environ:
+    if param != 'PROFILEREAD':
+        environ = environ + 'export ' + param + '=\'' + os.environ[param] + '\'; '
+
+# Record information about tasks
+taskinfo = {}
+
+def EnforceTrailingSlash(path):                                                                                                   
+  if path[-1] != '/':
+    return path + '/'
+  else:
+    return path
+
+def checkMagic(filepath):
+#  with open(filepath,"r") as f:
+#    if stopMagic in f.readline():
+#      return True
+ 
+  with open(filepath,"r") as f:
+    for line in f:
+      if stopMagic in line:
+        return True
+
+  return False
+
+  
+def checkUserExit(pid):
+  fpath=EnforceTrailingSlash(taskinfo[pid]['path'])+stopfile
+  if os.path.exists(fpath) and stopMagic=="":
+     verbose_print("exit because file "+fpath+" is present!!!!")
+     sys.exit(1)
+
+  if os.path.exists(fpath) and checkMagic(fpath):
+     verbose_print("exit because file "+fpath+" contains magic " + stopMagic)
+     sys.exit(1)
+
+# Wait for processes to exit
+# Handle only one returned process per call
+def wait():
+    finished = {}
+    stillSleepy=True
+    while stillSleepy:
+      for pid in taskinfo.keys():
+        if taskinfo[pid]['process'].poll() != None:
+            finished[pid] = {'status':taskinfo[pid]['process'].poll()}
+        checkUserExit(pid)
+
+      if len(finished) > 0:
+        pid = finished.keys()[0]
+        exit = signal = finished[pid]['status']
+        stillSleepy=False
+      else:
+        time.sleep(sleep)
+#        pid, status = os.wait()
+#        signal = status & 0xFF
+#        exit = status >> 8
+    id = taskinfo[pid]['id']
+    if exit != 0:
+        print >> sys.stderr, "'%s' killed by sig %d" % (taskinfo[pid]['task'], signal)
+    del taskinfo[pid]
+    return id
+
+# Signal handler for SIGINT
+def kill_all(signum, stack):
+    verbose_print('Taskfarm interrupted. Please check for orphaned processes.')
+    sys.exit(1)
+signal.signal(signal.SIGINT, kill_all)
+
+# Wait for a node to become free then run a task
+k=0
+for task in tasklist:
+    if len(node_ids) == 0:
+        node_ids.append(wait())
+    id = node_ids[0]
+    del node_ids[0]
+    task = environ + ' cd ' + os.environ['PWD'] + ' && ' + task
+    command = 'pbsdsh -n %d -- bash -c "%s"' % (id, task)
+    popen_tmp = Popen(['pbsdsh', '-n', str(id), '--', 'bash', '-c', task])
+    pid = popen_tmp.pid
+    taskinfo[pid] = {'id': id, 'task': command, 'process': popen_tmp, 'path':os.environ['PWD']+"/"+extraPaths[k]}
+    k += 1
+# Once all tasks have been started wait for them to finish
+while len(taskinfo) > 0:
+    wait()
+verbose_print('Taskfarm completed all tasks.')
