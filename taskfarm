@@ -48,6 +48,23 @@
 #                use TASKFARM_STOPMAGIC to define a word
 #              - TASKFARM_SLEEP controls at what intervals one checks for the file and, if the case,
 #                for the magic. Default value is 5 seconds
+# Version 2.5: New features
+#              - replace pdsh by mpirun wrapped tasks
+#              - added TASKFARM_GROUP specify how may tasks to group in a metatask
+#              - added TASKFARM_KEEP if the variable is set intermediate metatasks will not be
+#                deleted 
+#              - added TASKFARM_MPI if variable is set assumes that mpi binaries are executed 
+#              - added TASKFARM_MPI_LAUNCHER contains the launcher to be used to push the tasks
+#                default is mpirun, at time of writing intel mpirun path is added in the module
+#                specify a new one by using this variable.
+# Version 2.6: Bug fix
+#              - Issue with ShellShock fix.
+# Version 2.7: Bug fix
+#              - Remove empty lines from the task list.
+#              - Use I_MPI_PIN_PROCESSOR_LIST instead of numactl, in order to avoid clash between
+#                cores selected by the mpirun and the one required via numactl.
+#
+#
 
 import os
 import sys
@@ -58,8 +75,9 @@ import re
 from subprocess import Popen
 
 # Physical characteristics of the compute nodes
-cores_per_node = 24
-threads_per_core = 2
+lines=[ line.strip().replace('\t','').split(':') for line in open('/proc/cpuinfo') ]
+threads_per_core = len(set([ line[1] for line in lines if line[0]=='physical id']))
+cores_per_node = len(set([ line[1] for line in lines if line[0]=='processor']))/threads_per_core
 
 # A print function to control verbosity
 def verbose_print(str):
@@ -78,6 +96,7 @@ if 'TASKFARM_SMT' in os.environ:
     smt = threads_per_core
 else:
     smt = 1
+
 if 'TASKFARM_PPN' in os.environ:
     try:
         ppn = int(os.environ['TASKFARM_PPN'])
@@ -86,6 +105,16 @@ if 'TASKFARM_PPN' in os.environ:
         sys.exit(1)
 else:
     ppn = cores_per_node * smt
+
+if 'TASKFARM_MPI' in os.environ:
+    cores_per_task=cores_per_node/ppn
+else:
+    cores_per_task=1
+
+if 'TASKFARM_MPI_LAUNCHER' in os.environ:
+    launch=os.environ['TASKFARM_MPI_LAUNCHER']
+else:
+    launch='mpirun'
 
 if 'TASKFARM_SLEEP' in os.environ:
     sleep = float(os.environ['TASKFARM_SLEEP'])
@@ -102,6 +131,15 @@ if 'TASKFARM_STOPMAGIC' in os.environ:
   stopMagic=os.environ['TASKFARM_STOPMAGIC']
 else:
   stopMagic=""
+if 'TASKFARM_GROUP' in os.environ:
+  groupTasks=int(os.environ['TASKFARM_GROUP'])
+else:
+  groupTasks=1
+if 'TASKFARM_KEEP' in os.environ:
+  keep=True
+else:
+  keep=False
+
 # Error if an invalid process count is requested
 if smt > 1 and ppn > cores_per_node * threads_per_core:
     print >> sys.stderr, 'Error: $TASKFARM_PPN must not exceed %d processes per node when $TASKFARM_SMT is set.' %(cores_per_node * threads_per_core,)
@@ -117,12 +155,16 @@ elif ppn < 1:
 work_nodes = []
 node_ids = []
 id_map = {}
+core_range={}
+jid=os.environ['PBS_JOBID']
+cpath=os.environ['PWD']
 try:
     nodef = open(os.environ['PBS_NODEFILE'])
 except KeyError:
     print >> sys.stderr, 'Error opening PBS_NODEFILE. Exiting.'
     sys.exit(2)
 id = 0
+cpt=cores_per_node/ppn
 for line in nodef:
     node = line.strip()
     if work_nodes.count(node) == 0:
@@ -131,6 +173,9 @@ for line in nodef:
             node_ids.append(tmp_id)
             work_nodes.append(node)
             id_map[tmp_id] = node
+            start=i%cores_per_node*cpt
+            end=start+cpt-1
+            core_range[tmp_id]=str(start)+"-"+str(end)
     id += 1
 nodef.close()
 verbose_print('Taskfarm started with %d workers (%d per node).' % (len(work_nodes), ppn))
@@ -142,6 +187,19 @@ def extractPaths(taskline):
   if np is None:
     return ""
   return np.groups()[0]
+
+def processLine(line):
+  if groupTasks!=1: 
+    return preservePath(line)
+  else:     
+    return line
+
+def preservePath(line):
+  if line[-1]==';':
+    return line+" cd "+cpath
+  else:
+    return line + "; cd "+cpath
+
 # Generate a task list from file
 tasklist = []
 extraPaths = []
@@ -151,24 +209,35 @@ try:
 except:
     print >> sys.stderr, 'Error opening task file. Exiting.'
     sys.exit(2)
-for line in taskf:
-    parsedline = line.replace('%TASKFARM_TASKNUM%', str(tasknum))
-    tasklist.append(parsedline.strip())
-    extraPaths.append(extractPaths(line))
-    tasknum = tasknum + 1
+
+l1 = [ processLine(line.strip()) for line in taskf if len(line.strip()) > 0]
+lines = [ l1[i].replace('%TASKFARM_TASKNUM%', str(i)) for i in range(len(l1)) ]
+if groupTasks != 1:
+  tf=len(lines)
+  tasklist = filter(None,[' && '.join(lines[i*groupTasks:(i+1)*groupTasks]) for i in range(tf//groupTasks+1)])  
+else:
+  tasklist = lines
+tasknum=len(tasklist)
+extraPaths = [ extractPaths(task) for task in tasklist ]
 taskf.close()
-verbose_print('Taskfarm read %d tasks from file \'%s\'.' % (len(tasklist), taskfile))
+
+if groupTasks	== 1 :
+    verbose_print('Taskfarm read %d tasks from file \'%s\'.' % (len(tasklist), taskfile))
+else:
+    verbose_print('Taskfarm read %d tasks from file \'%s\' grouped as %d metatasks.' % (tf,taskfile,len(tasklist)))
 
 if len(tasklist) % len(work_nodes) != 0:
     verbose_print('Warning: Taskfarm input should ideally provide a multiple of %d tasks for %d workers.' % (len(work_nodes), len(work_nodes)))
 if len(tasklist) / len(work_nodes) > 20:
     verbose_print('Warning: There are %d tasks for %d workers. Taskfarm is not ideal for high-throughput workloads.' % (len(tasklist), len(work_nodes)))
     verbose_print('Warning: Running many tasks of a very short duration with Taskfarm is quite inefficient.')
+    verbose_print('Info: You can aggregate tasks using export TASKFARM_GROUP=xxx')
+    verbose_print('Info: with xxx how many consecutive tasks to group in a metatask')
 
 # Build an environment
 environ = ''
 for param in os.environ:
-    if param != 'PROFILEREAD':
+    if param not in ['PROFILEREAD', 'BASH_FUNC_module()'] :
         environ = environ + 'export ' + param + '=\'' + os.environ[param] + '\'; '
 
 # Record information about tasks
@@ -181,10 +250,6 @@ def EnforceTrailingSlash(path):
     return path
 
 def checkMagic(filepath):
-#  with open(filepath,"r") as f:
-#    if stopMagic in f.readline():
-#      return True
- 
   with open(filepath,"r") as f:
     for line in f:
       if stopMagic in line:
@@ -226,6 +291,8 @@ def wait():
     id = taskinfo[pid]['id']
     if exit != 0:
         print >> sys.stderr, "'%s' killed by sig %d" % (taskinfo[pid]['task'], signal)
+    if not keep:
+      popen_tmp = os.unlink(taskinfo[pid]['script'])
     del taskinfo[pid]
     return id
 
@@ -241,12 +308,20 @@ for task in tasklist:
     if len(node_ids) == 0:
         node_ids.append(wait())
     id = node_ids[0]
+    host = id_map[id]
+    cores=core_range[id]
     del node_ids[0]
     task = environ + ' cd ' + os.environ['PWD'] + ' && ' + task
-    command = 'pbsdsh -n %d -- bash -c "%s"' % (id, task)
-    popen_tmp = Popen(['pbsdsh', '-n', str(id), '--', 'bash', '-c', task])
+    fp=cpath+"/task-"+host+"-id"+str(id)+"-"+jid + '.' + str(k)
+    f=open(fp,"w")
+    f.write("#!/bin/bash\n");
+    f.write(task)
+    f.close()
+    os.chmod(fp,0755)
+    command = "%s -n %d -env I_MPI_PIN_PROCESSOR_LIST %s -host %s %s" % (launch,cores_per_task,cores,host,fp)
+    popen_tmp = Popen([launch,'-env','I_MPI_PIN_PROCESSOR_LIST',cores,'-n', str(cores_per_task),'-host',host,fp])
     pid = popen_tmp.pid
-    taskinfo[pid] = {'id': id, 'task': command, 'process': popen_tmp, 'path':os.environ['PWD']+"/"+extraPaths[k]}
+    taskinfo[pid] = {'id': id, 'task': command, 'process': popen_tmp, 'path':cpath+"/"+extraPaths[k],'script':fp}
     k += 1
 # Once all tasks have been started wait for them to finish
 while len(taskinfo) > 0:
