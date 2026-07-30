@@ -90,12 +90,17 @@
 #                with -bootstrap-exec and -bootstrap-exec-args. However it appears that not using
 #                -bootstrap option seems to work, in the "launch" variable. 
 #
-# Version 3.0: changed script to work on Meluxina
+# Version 3.0: changed script to work on Meluxina (AR)
 #                Changed to work with python 3, e.g. altered print statements.
 #                Removed the adding of envirinment variables to task scripts.
 #                There was a syntax error that prevented them running.
 #                Had to convert some variables to int from float.
 #                Only works on 1 node, perhaps restrictions on number of ssh connections
+# Version 3.1: major changes to make work with srun (AR)
+#                Added TASKFARM_PROCS_PER_TASK for multi-threaded apps
+#                Added TASKFARM_MPI_PROCS for MPI enabled apps
+#                SLURM vars set from TASKFARM environment variables
+#                Now works on multiple nodes
 
 import os
 import sys
@@ -123,16 +128,13 @@ def verbose_print(str):
         sys.stdout.flush()
 
 # Check comand line arguments
-if len(sys.argv) != 2:
-    print('Usage: {0} <tasklist>',format(sys.argv[0]),file=sys.stderr,flush=True)
+if len(sys.argv) != 2 or sys.argv[1]=="-h":
+    print('Usage: taskfarm <tasklist>',file=sys.stderr,flush=True)
+    print('TASKFARM_PPN: number of tasks per node (def=cores per node)',file=sys.stderr,flush=True)
+    print('TASKFARM_PROCS_PER_TASK: number of threads per task (def=1)',file=sys.stderr,flush=True)
+    print('TASKFARM_MPI_PROCS: number of MPI procs per task (def=1)',file=sys.stderr,flush=True) 
     sys.exit(1)
 taskfile = sys.argv[1]
-
-# How many processes per node
-if 'TASKFARM_SMT' in os.environ:
-    smt = threads_per_core
-else:
-    smt = 1
 
 if 'TASKFARM_PPN' in os.environ:
     try:
@@ -141,17 +143,32 @@ if 'TASKFARM_PPN' in os.environ:
         print('Error: $TASKFARM_PPN must be an integer value.a',file=sys.stderr,flush=True)
         sys.exit(1)
 else:
-    ppn = cores_per_node * smt
+    ppn = cores_per_node
 
-if 'TASKFARM_MPI' in os.environ:
-    cores_per_task=cores_per_node/ppn
+
+if 'TASKFARM_PROCS_PER_TASK' in os.environ:
+    try:
+         cores_per_task = int(os.environ['TASKFARM_PROCS_PER_TASK'])
+    except:
+        print('Error: $TASKFARM_RPOCS_PER_TASK  must be an integer value.a',file=sys.stderr,flush=True)
+        sys.exit(1)
 else:
-    cores_per_task=1
+    cores_per_task = 1
+
+if 'TASKFARM_MPI_PROCS' in os.environ:
+    try:
+        mpi_per_task = int(os.environ['TASKFARM_MPI_PROCS'])
+    except:
+        print('Error: $TASKFARM_MPI_PROCS must be an integer value',file=sys.stderr,flush=True)
+        sys.exit(1)
+else:
+    mpi_per_task = 1
+
 
 if 'TASKFARM_MPI_LAUNCHER' in os.environ:
     launch=os.environ['TASKFARM_MPI_LAUNCHER']
 else:
-    launch='/apps/USE/easybuild/release/2023.1/software/impi/2021.9.0-intel-compilers-2023.1.0/mpi/2021.9.0/bin/mpiexec'
+    launch='srun'
 
 if 'TASKFARM_SLEEP' in os.environ:
     sleep = float(os.environ['TASKFARM_SLEEP'])
@@ -178,24 +195,21 @@ else:
   keep=False
 
 # Error if an invalid process count is requested
-if smt > 1 and ppn > cores_per_node * threads_per_core:
-    print('Error: $TASKFARM_PPN must not exceed {0} processes per node when $TASKFARM_SMT is set.'.format(cores_per_node * threads_per_core),file=sys.stderr,flush=True)
+total_cores_per_node = ppn*cores_per_task*mpi_per_task
+verbose_print(' total_cores = %d'  % (total_cores_per_node))
+if total_cores_per_node > cores_per_node:
+    print('Error:cores per node must not exceed {0} processes per node.'.format(cores_per_node),file=sys.stderr,flush=True)
     sys.exit(1)
-elif smt == 1 and ppn > cores_per_node:
-    print('Error: $TASKFARM_PPN must not exceed {0} processes per node.'.format(cores_per_node),file=sys.stderr,flush=True)
-    sys.exit(1)
-elif ppn < 1:
+elif total_cores_per_node < 1:
     print('Error: $TASKFARM_PPN must request one or more processes per node.',file=sys.stderr,flush=True)
     sys.exit(1)
 
+    
 if 'SLURM_JOBID' not in os.environ:
     print('Error: no $SLURM_JOBID environment variable found. Do not run taskfarm on login nodes.',file=sys.stderr,fluysh=True)
     sys.exit(1)
 if 'SLURM_JOB_NODELIST' not in os.environ:
     print('Error: no $SLURM_JOB_NODELIST environment variable found. Do not run taskfarm on login nodes.',file=sys.stderr,flush=True)
-    sys.exit(1)
-if os.environ['SLURM_NNODES'] != "1":
-    print('Error: taskfarm will only work on a single node',file=sys.stderr,flush=True)
     sys.exit(1)
 
 
@@ -231,8 +245,9 @@ for node in exp_nodelist:
             work_nodes.append(node)
             id_map[tmp_id] = node
             start=int(i%cores_per_node*cpt)
-            end=int(start+cpt-1)
-            core_range[tmp_id]=str(start)+"-"+str(end)
+            end=int(start+cpt)
+            lrng = list(range(start,end))
+            core_range[tmp_id]=','.join(str(scpu) for scpu in lrng)
     id += 1
 
 verbose_print('Taskfarm started with %d workers (%d per node).' % (len(work_nodes), ppn))
@@ -283,8 +298,6 @@ if groupTasks	== 1 :
 else:
     verbose_print('Taskfarm read %d tasks from file \'%s\' grouped as %d metatasks.' % (tf,taskfile,len(tasklist)))
 
-# if len(tasklist) % len(work_nodes) != 0:
-#     verbose_print('Warning: Taskfarm input should ideally provide a multiple of %d tasks for %d workers.' % (len(work_nodes), len(work_nodes)))
 if len(tasklist) / len(work_nodes) > 20:
     verbose_print('Warning: Running many tasks of a very short duration with Taskfarm is quite inefficient.')
     verbose_print('Info: You can aggregate tasks using export TASKFARM_GROUP=xxx')
@@ -292,6 +305,10 @@ if len(tasklist) / len(work_nodes) > 20:
 
 # Build an environment
 environ = ''
+os.environ['SLURM_NTASKS_PER_NODE']=str(ppn*mpi_per_task)
+os.environ['SLURM_TASKS_PER_NODE']=str(ppn*mpi_per_task)
+os.environ['SLURM_CPUS_PER_TASK']=str(cores_per_task)
+os.environ['SLURM_NTASKS']=str(len(tasklist*mpi_per_task))
 for param in os.environ:
     if param not in ['PROFILEREAD', 'BASH_FUNC_module()'] :
         environ = environ + 'export ' + param + '=\'' + os.environ[param] + '\'; '
@@ -373,14 +390,9 @@ for task in tasklist:
     f.write(task)
     f.close()
     os.chmod(fp,stat.S_IRWXU)
-    if cores_per_task == 1:
-        command = "%s -env I_MPI_PIN_DOMAIN node -n %d -host %s numactl --physcpubind=%s %s" % \
-  	(launch, cores_per_task, host, cores, fp)
-  	
-    else:
-        command = "%s -env I_MPI_PIN_PROCESSOR_LIST %s -n %d -host %s %s" % \
-	(launch, cores, cores_per_task, host, fp)
-	
+    command = "%s -N 1 -n %d -c %d --nodelist=%s --exact %s" % (launch,mpi_per_task,cores_per_task,host,fp)
+    verbose_print(command)
+
     command = command.split(' ')
     popen_tmp = Popen(command)
     pid = popen_tmp.pid
