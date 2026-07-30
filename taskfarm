@@ -1,4 +1,4 @@
-#!/usr/bin/python -E
+#!/usr/bin/env python3
 #
 # ICHEC Taskfarm utility
 # 
@@ -80,14 +80,14 @@ threads_per_core = len(set([ line[1] for line in lines if line[0]=='physical id'
 cores_per_node = len(set([ line[1] for line in lines if line[0]=='processor']))/threads_per_core
 
 # A print function to control verbosity
-def verbose_print(str):
+def verbose_print(string):
     if not 'TASKFARM_SILENT' in os.environ:
-        print str
+        print(string)
         sys.stdout.flush()
 
 # Check comand line arguments
 if len(sys.argv) != 2:
-    print >> sys.stderr, 'Usage: %s <tasklist>' % sys.argv[0]
+    sys.stderr.write('Usage: %s <tasklist>' % sys.argv[0] + '\n')
     sys.exit(1)
 taskfile = sys.argv[1]
 
@@ -101,7 +101,7 @@ if 'TASKFARM_PPN' in os.environ:
     try:
         ppn = int(os.environ['TASKFARM_PPN'])
     except:
-        print >> sys.stderr, 'Error: $TASKFARM_PPN must be an integer value.'
+        sys.stderr.write('Error: $TASKFARM_PPN must be an integer value.\n')
         sys.exit(1)
 else:
     ppn = cores_per_node * smt
@@ -142,13 +142,13 @@ else:
 
 # Error if an invalid process count is requested
 if smt > 1 and ppn > cores_per_node * threads_per_core:
-    print >> sys.stderr, 'Error: $TASKFARM_PPN must not exceed %d processes per node when $TASKFARM_SMT is set.' %(cores_per_node * threads_per_core,)
+    sys.stderr.write('Error: $TASKFARM_PPN must not exceed %d processes per node when $TASKFARM_SMT is set.' %(cores_per_node * threads_per_core,) + '\n')
     sys.exit(1)
 elif smt == 1 and ppn > cores_per_node:
-    print >> sys.stderr, 'Error: $TASKFARM_PPN must not exceed %d processes per node.' %(cores_per_node,)
+    sys.stderr.write('Error: $TASKFARM_PPN must not exceed %d processes per node.' %(cores_per_node,) + '\n')
     sys.exit(1)
 elif ppn < 1:
-    print >> sys.stderr, 'Error: $TASKFARM_PPN must request one or more processes per node.'
+    sys.stderr.write('Error: $TASKFARM_PPN must request one or more processes per node.\n')
     sys.exit(1)
 
 # Generate a list of unique nodes
@@ -156,12 +156,12 @@ work_nodes = []
 node_ids = []
 id_map = {}
 core_range={}
-jid=os.environ['PBS_JOBID']
+jid=os.environ['SLURM_JOBID']
 cpath=os.environ['PWD']
 try:
-    nodef = open(os.environ['PBS_NODEFILE'])
-except KeyError:
-    print >> sys.stderr, 'Error opening PBS_NODEFILE. Exiting.'
+    nodef = os.environ['SLURM_JOB_NODELIST']
+except:
+    sys.stderr.write('Error opening SLURM_JOB_NODELIST. Exiting.\n')
     sys.exit(2)
 id = 0
 cpt=cores_per_node/ppn
@@ -207,7 +207,7 @@ tasknum = 0
 try:
     taskf = open(taskfile)
 except:
-    print >> sys.stderr, 'Error opening task file. Exiting.'
+    sys.stderr.write('Error opening task file. Exiting.\n')
     sys.exit(2)
 
 l1 = [ processLine(line.strip()) for line in taskf if len(line.strip()) > 0]
@@ -290,7 +290,7 @@ def wait():
 #        exit = status >> 8
     id = taskinfo[pid]['id']
     if exit != 0:
-        print >> sys.stderr, "'%s' killed by sig %d" % (taskinfo[pid]['task'], signal)
+        sys.stderr.write("'%s' killed by sig %d" % (taskinfo[pid]['task'], signal) + '\n')
     if not keep:
       popen_tmp = os.unlink(taskinfo[pid]['script'])
     del taskinfo[pid]
@@ -317,7 +317,7 @@ for task in tasklist:
     f.write("#!/bin/bash\n");
     f.write(task)
     f.close()
-    os.chmod(fp,0755)
+    os.chmod(fp,0o755)
     command = "%s -n %d -env I_MPI_PIN_PROCESSOR_LIST %s -host %s %s" % (launch,cores_per_task,cores,host,fp)
     popen_tmp = Popen([launch,'-env','I_MPI_PIN_PROCESSOR_LIST',cores,'-n', str(cores_per_task),'-host',host,fp])
     pid = popen_tmp.pid
